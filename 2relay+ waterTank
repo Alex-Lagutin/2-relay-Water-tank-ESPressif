@@ -1,0 +1,268 @@
+/*
+ * ============================================================
+ *  ESP32 — 2 реле + кнопки + датчик уровня воды JSN-SR04T
+ *  ESP RainMaker | ESP32 Arduino Core 2.0.17
+ * ============================================================
+ *  Устройства в приложении RainMaker:
+ *   - Obuvnitsa  → Switch (реле 1)
+ *   - Vana       → Switch (реле 2)
+ *   - WaterTank  → уровень % + алерт низкого уровня
+ *
+ *  Пины:
+ *   Реле 1    → GPIO 16
+ *   Реле 2    → GPIO 17
+ *   Кнопка 1  → GPIO 13
+ *   Кнопка 2  → GPIO 12
+ *   Wi-Fi LED → GPIO 2
+ *   RESET     → GPIO 0  (3 сек = сброс Wi-Fi, 10 сек = factory reset)
+ *   TRIG      → GPIO 5
+ *   ECHO      → GPIO 18 (через делитель 1кОм + 2кОм!)
+ *
+ *  Библиотеки:
+ *   - ESP RainMaker (by Espressif Systems)
+ *   - AceButton (by Brian Park)
+ * ============================================================
+ */
+
+#include "RMaker.h"
+#include <esp_rmaker_utils.h>
+#include "WiFi.h"
+#include "WiFiProv.h"
+#include <AceButton.h>
+#include <time.h>
+
+using namespace ace_button;
+
+// ─── Провижининг ──────────────────────────────────────────────
+const char *service_name = "PROV_12345";
+const char *pop          = "1234567";
+
+// ─── Имена устройств ──────────────────────────────────────────
+char deviceName_1[] = "Obuvnitsa";
+char deviceName_2[] = "Vana";
+char deviceName_3[] = "WaterTank";
+
+// ─── Пины реле и кнопок ───────────────────────────────────────
+static uint8_t RelayPin1   = 16;
+static uint8_t RelayPin2   = 17;
+static uint8_t SwitchPin1  = 13;
+static uint8_t SwitchPin2  = 12;
+static uint8_t wifiLed     = 2;
+static uint8_t gpio_reset  = 0;
+
+// ─── Пины датчика ─────────────────────────────────────────────
+#define TRIG_PIN  5
+#define ECHO_PIN  18
+
+// ─── Параметры резервуара ─────────────────────────────────────
+#define TANK_EMPTY_CM        100.0  // расстояние до дна пустого бака (см)
+#define TANK_FULL_CM          10.0  // расстояние до воды при полном баке (см)
+#define LOW_LEVEL_THRESHOLD   20    // порог алерта (%)
+#define UPDATE_INTERVAL_MS    5000  // интервал опроса датчика
+#define TANK_VOLUME_L        200.0  // объём бака в литрах
+
+// ─── Состояние реле ───────────────────────────────────────────
+bool toggleState_1 = false;
+bool toggleState_2 = false;
+
+// ─── Кнопки (AceButton) ───────────────────────────────────────
+ButtonConfig config1;
+AceButton button1(&config1);
+ButtonConfig config2;
+AceButton button2(&config2);
+
+void button1Handler(AceButton*, uint8_t, uint8_t);
+void button2Handler(AceButton*, uint8_t, uint8_t);
+
+// ─── RainMaker устройства ─────────────────────────────────────
+static Switch          my_switch1(deviceName_1, &RelayPin1);
+static Switch          my_switch2(deviceName_2, &RelayPin2);
+static Device water_sensor(deviceName_3, "esp.device.sensor", nullptr);
+
+static Param level_param("Level %", "esp.param.level", value(0), PROP_FLAG_READ | PROP_FLAG_TIME_SERIES);
+static Param distance_param("Distance cm", "esp.param.distance", value(0.0f), PROP_FLAG_READ);
+static Param volume_param("Water L", "esp.param.water-volume", value(0.0f), PROP_FLAG_READ);
+static Param alert_param("LowAlert", "esp.param.low-alert",   value(false), PROP_FLAG_READ);
+static Param time_param("Last Update", "esp.param.last-update", value("--:--:--"), PROP_FLAG_READ);
+
+// ─────────────────────────────────────────────────────────────
+//  Коллбэк записи для реле (из приложения)
+// ─────────────────────────────────────────────────────────────
+void write_callback(Device *device, Param *param, const param_val_t val, void *priv_data, write_ctx_t *ctx) {
+    const char *device_name = device->getDeviceName();
+    const char *param_name  = param->getParamName();
+
+    if (strcmp(param_name, "Power") == 0) {
+        if (strcmp(device_name, deviceName_1) == 0) {
+            toggleState_1 = val.val.b;
+            digitalWrite(RelayPin1, toggleState_1 ? HIGH : LOW);
+        } else if (strcmp(device_name, deviceName_2) == 0) {
+            toggleState_2 = val.val.b;
+            digitalWrite(RelayPin2, toggleState_2 ? HIGH : LOW);
+        }
+        param->updateAndReport(val);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Датчик JSN-SR04T
+// ─────────────────────────────────────────────────────────────
+float measureDistanceCm() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(4);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+    if (duration == 0) return -1.0;
+    return (duration * 0.0343) / 2.0;
+}
+
+int distanceToLevel(float cm) {
+    if (cm < 0) return -1;
+    float level = (TANK_EMPTY_CM - cm) / (TANK_EMPTY_CM - TANK_FULL_CM) * 100.0;
+    if (level < 0)   level = 0;
+    if (level > 100) level = 100;
+    return (int)level;
+}
+
+void sendSensorData() {
+    float cm = measureDistanceCm();
+    if (cm < 0) {
+        Serial.println("[SENSOR] Нет сигнала от датчика");
+        return;
+    }
+    int level     = distanceToLevel(cm);
+    float liters  = (level / 100.0f) * TANK_VOLUME_L;
+    bool lowAlert = (level <= LOW_LEVEL_THRESHOLD);
+    Serial.printf("[SENSOR] %.1f см → %d%% → %.1f л  алерт:%s\n", cm, level, liters, lowAlert ? "ДА" : "нет");
+    water_sensor.updateAndReportParam("Level %", level);
+    water_sensor.updateAndReportParam("Distance cm", cm);
+    water_sensor.updateAndReportParam("Water L", liters);
+    water_sensor.updateAndReportParam("LowAlert", lowAlert);
+    // Время последнего измерения
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        char timeStr[16];
+        strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+        water_sensor.updateAndReportParam("Last Update", timeStr);
+        Serial.printf("[TIME] %s\n", timeStr);
+    }
+    // Уведомление при низком уровне
+    static bool lastAlert = false;
+    if (lowAlert && !lastAlert) esp_rmaker_raise_alert("Низкий уровень воды!");
+    lastAlert = lowAlert;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+    Serial.begin(115200);
+
+    // NTP — синхронизация времени (UTC+2 Киев/Харьков)
+    configTime(2 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+    // Реле — сразу LOW чтобы не включились при загрузке
+    pinMode(RelayPin1, OUTPUT);  digitalWrite(RelayPin1, LOW);
+    pinMode(RelayPin2, OUTPUT);  digitalWrite(RelayPin2, LOW);
+    pinMode(wifiLed,   OUTPUT);  digitalWrite(wifiLed,   LOW);
+
+    // Кнопки и сброс
+    pinMode(SwitchPin1,  INPUT_PULLUP);
+    pinMode(SwitchPin2,  INPUT_PULLUP);
+    pinMode(gpio_reset,  INPUT);
+
+    // Датчик
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+    // AceButton
+    config1.setEventHandler(button1Handler);
+    config2.setEventHandler(button2Handler);
+    button1.init(SwitchPin1);
+    button2.init(SwitchPin2);
+
+    // RainMaker — регистрируем все три устройства
+    Node my_node = RMaker.initNode("ESP32_Relay_Water_System");
+
+    my_switch1.addCb(write_callback);
+    my_switch2.addCb(write_callback);
+
+    water_sensor.addParam(level_param);
+    water_sensor.addParam(volume_param);
+    water_sensor.addParam(distance_param);
+    water_sensor.assignPrimaryParam(const_cast<param_handle_t*>(level_param.getParamHandle()));
+    water_sensor.addParam(alert_param);
+
+    my_node.addDevice(my_switch1);
+    my_node.addDevice(my_switch2);
+    my_node.addDevice(water_sensor);
+
+    RMaker.enableTZService();
+    RMaker.enableSchedule();
+    RMaker.enableOTA(OTA_USING_PARAMS);  // обновление по воздуху
+    RMaker.start();
+
+    WiFiProv.beginProvision(
+        WIFI_PROV_SCHEME_BLE,
+        WIFI_PROV_SCHEME_HANDLER_FREE_BTDM,
+        WIFI_PROV_SECURITY_1,
+        pop,
+        service_name
+    );
+
+    // Синхронизируем начальное состояние реле с приложением
+    my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, false);
+    my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, false);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP
+// ─────────────────────────────────────────────────────────────
+void loop() {
+    // Сброс по кнопке BOOT:
+    // 3–10 сек → сброс Wi-Fi (провижининг заново)
+    // >10 сек  → factory reset
+    if (digitalRead(gpio_reset) == LOW) {
+        delay(100);
+        int startTime = millis();
+        while (digitalRead(gpio_reset) == LOW) delay(50);
+        int endTime = millis();
+        if      ((endTime - startTime) > 10000) RMakerFactoryReset(2);
+        else if ((endTime - startTime) > 3000)  RMakerWiFiReset(2);
+    }
+
+    // Wi-Fi индикатор
+    digitalWrite(wifiLed, (WiFi.status() == WL_CONNECTED));
+
+    // Кнопки
+    button1.check();
+    button2.check();
+
+    // Датчик уровня
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate >= UPDATE_INTERVAL_MS) {
+        lastUpdate = millis();
+        sendSensorData();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Обработчики кнопок
+// ─────────────────────────────────────────────────────────────
+void button1Handler(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+    if (eventType == AceButton::kEventPressed) {
+        toggleState_1 = !toggleState_1;
+        digitalWrite(RelayPin1, toggleState_1 ? HIGH : LOW);
+        my_switch1.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_1);
+    }
+}
+
+void button2Handler(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+    if (eventType == AceButton::kEventPressed) {
+        toggleState_2 = !toggleState_2;
+        digitalWrite(RelayPin2, toggleState_2 ? HIGH : LOW);
+        my_switch2.updateAndReportParam(ESP_RMAKER_DEF_POWER_NAME, toggleState_2);
+    }
+}
